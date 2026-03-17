@@ -8,8 +8,9 @@ import json
 import base64
 import argparse
 from pathlib import Path
-from mistralai import Mistral, DocumentURLChunk
+from mistralai import Mistral, DocumentURLChunk, ImageURLChunk
 from mistralai.models import OCRResponse
+from PIL import Image
 
 
 __version__ = "0.1.0"
@@ -208,18 +209,216 @@ def process_pdf(pdf_path: Path, api_key: str, output_json_path: Path = None) -> 
         sys.exit(1)
 
 
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.webp'}
+
+MIME_TYPES = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.bmp': 'image/bmp',
+    '.tiff': 'image/tiff',
+    '.tif': 'image/tiff',
+    '.webp': 'image/webp',
+}
+
+
+def chunk_tall_image(image_path: Path, max_ratio: float = 3.0, search_band_ratio: float = 0.2) -> list[Path]:
+    """
+    Split a tall image into multiple chunks at whitespace gaps.
+
+    Returns a list of paths: the original path if no chunking is needed,
+    or paths to the saved chunk files.
+    """
+    img = Image.open(image_path)
+    width, height = img.size
+
+    if height / width <= max_ratio:
+        return [image_path]
+
+    chunk_height = int(width * max_ratio)
+    band_size = int(chunk_height * search_band_ratio)
+
+    # Find cut points
+    cut_ys = []
+    target_y = chunk_height
+    while target_y < height:
+        band_top = max(0, target_y - band_size)
+        band_bottom = min(height, target_y + band_size)
+
+        band = img.crop((0, band_top, width, band_bottom)).convert('L')
+        pixels = list(band.getdata())
+        band_height = band_bottom - band_top
+
+        # Compute per-row variance to find the most uniform row
+        min_var = float('inf')
+        best_row = 0
+        for row_idx in range(band_height):
+            row_start = row_idx * width
+            row_pixels = pixels[row_start:row_start + width]
+            mean = sum(row_pixels) / width
+            var = sum((p - mean) ** 2 for p in row_pixels) / width
+            if var < min_var:
+                min_var = var
+                best_row = row_idx
+        cut_y = band_top + best_row
+        cut_ys.append(cut_y)
+
+        target_y = cut_y + chunk_height
+
+    # Slice and save chunks into a dedicated directory
+    stem = image_path.stem
+    suffix = image_path.suffix or '.png'
+    chunks_dir = image_path.parent / f"{stem}_chunks"
+    chunks_dir.mkdir(exist_ok=True)
+
+    boundaries = [0] + cut_ys + [height]
+    chunk_paths = []
+    for i in range(len(boundaries) - 1):
+        y_start = boundaries[i]
+        y_end = boundaries[i + 1]
+        chunk = img.crop((0, y_start, width, y_end))
+        chunk_path = chunks_dir / f"{stem}_chunk{i + 1}{suffix}"
+        chunk.save(chunk_path)
+        chunk_paths.append(chunk_path)
+        print(f"  Saved chunk {i + 1}: rows {y_start}-{y_end} -> {chunk_path.name}")
+
+    return chunk_paths
+
+
+def _ocr_single_image(client: Mistral, image_path: Path, image_base: str,
+                       page_offset: int, image_counter_start: int,
+                       images_dir: Path = None,
+                       output_json_path: Path = None) -> tuple[str, int, Path]:
+    """
+    Run OCR on a single image and return (markdown, next_image_counter, images_dir).
+    """
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
+
+    ext = image_path.suffix.lower()
+    mime_type = MIME_TYPES.get(ext, 'image/png')
+    b64 = base64.b64encode(image_bytes).decode('utf-8')
+    data_url = f"data:{mime_type};base64,{b64}"
+
+    ocr_response = client.ocr.process(
+        document=ImageURLChunk(image_url=data_url),
+        model="mistral-ocr-latest",
+        include_image_base64=True
+    )
+
+    if output_json_path:
+        try:
+            with open(output_json_path, "w", encoding="utf-8") as json_file:
+                if hasattr(ocr_response, 'model_dump'):
+                    json.dump(ocr_response.model_dump(), json_file, indent=4, ensure_ascii=False)
+                else:
+                    json.dump(ocr_response.dict(), json_file, indent=4, ensure_ascii=False)
+            print(f"Raw OCR response saved to {output_json_path}")
+        except Exception as json_err:
+            print(f"Warning: Could not save raw OCR JSON: {json_err}", file=sys.stderr)
+
+    image_counter = image_counter_start
+    markdown_parts = []
+
+    for page_index, page in enumerate(ocr_response.pages):
+        current_page_markdown = page.markdown
+        page_image_mapping = {}
+
+        if page.images and not images_dir:
+            images_dir = image_path.parent / f"{image_base}_images"
+            images_dir.mkdir(exist_ok=True)
+
+        for image_obj in page.images:
+            base64_str = image_obj.image_base64
+            if not base64_str:
+                continue
+
+            if base64_str.startswith("data:"):
+                try:
+                    base64_str = base64_str.split(",", 1)[1]
+                except IndexError:
+                    continue
+
+            try:
+                img_bytes = base64.b64decode(base64_str)
+            except Exception as decode_err:
+                print(f"Warning: Base64 decode error for image {image_obj.id} on page {page_offset + page_index + 1}: {decode_err}", file=sys.stderr)
+                continue
+
+            original_ext = Path(image_obj.id).suffix
+            out_ext = original_ext if original_ext else ".png"
+            new_image_name = f"{image_base}_p{page_offset + page_index + 1}_img{image_counter}{out_ext}"
+            image_counter += 1
+
+            image_output_path = images_dir / new_image_name
+            try:
+                with open(image_output_path, "wb") as img_file:
+                    img_file.write(img_bytes)
+                page_image_mapping[image_obj.id] = new_image_name
+            except IOError as io_err:
+                print(f"Warning: Could not write image file {image_output_path}: {io_err}", file=sys.stderr)
+                continue
+
+        updated_page_markdown = replace_images_in_markdown_with_wikilinks(current_page_markdown, page_image_mapping)
+        markdown_parts.append(updated_page_markdown)
+
+    markdown = "\n\n---\n\n".join(markdown_parts)
+    return markdown, image_counter, images_dir
+
+
+def process_image(image_path: Path, api_key: str, output_json_path: Path = None, max_ratio: float = 3.0) -> str:
+    """
+    Process an image file using Mistral OCR and return markdown content.
+    Tall images are automatically chunked before OCR.
+    """
+    client = Mistral(api_key=api_key)
+    image_base = image_path.stem
+
+    print(f"Processing {image_path.name}...")
+
+    # Chunk tall images
+    chunks = chunk_tall_image(image_path, max_ratio=max_ratio)
+    if len(chunks) > 1:
+        print(f"Image split into {len(chunks)} chunks for OCR.")
+
+    image_counter = 1
+    images_dir = None
+    markdown_parts = []
+
+    for i, chunk_path in enumerate(chunks):
+        print(f"Calling OCR API{f' (chunk {i + 1}/{len(chunks)})' if len(chunks) > 1 else ''}...")
+        # Only save JSON for non-chunked (single) images
+        json_path = output_json_path if len(chunks) == 1 else None
+        md, image_counter, images_dir = _ocr_single_image(
+            client, chunk_path, image_base,
+            page_offset=i, image_counter_start=image_counter,
+            images_dir=images_dir,
+            output_json_path=json_path,
+        )
+        markdown_parts.append(md)
+
+    if output_json_path and len(chunks) > 1:
+        print(f"Note: --output-json is not supported with chunked images.", file=sys.stderr)
+
+    print(f"OCR processing complete for {image_path.name}.")
+    return "\n\n".join(markdown_parts)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Convert PDF files to markdown using Mistral OCR")
-    
+    parser = argparse.ArgumentParser(description="Convert PDF or image files to markdown using Mistral OCR")
+
     # Config options
     parser.add_argument("-sk", "--set-key", help="Config key to set")
     parser.add_argument("-sv", "--set-value", help="Value to set for the config key")
-    
+
     # Input and output file options
-    parser.add_argument("input", help="Input PDF file", nargs="?")
+    parser.add_argument("input", help="Input PDF or image file", nargs="?")
     parser.add_argument("-o", "--output", help="Output markdown file (default: input filename with .md extension)")
     parser.add_argument("--output-json", help="Save raw OCR response to a JSON file")
-    
+    parser.add_argument("--max-ratio", type=float, default=3.0,
+                        help="Max height/width ratio before chunking tall images (default: 3.0)")
+
     args = parser.parse_args()
     
     # Handle setting config values
@@ -236,36 +435,52 @@ def main():
         else:
             parser.error("input file is required when not setting config values")
     
-    # Process PDF file
-    pdf_path = Path(args.input)
-    if not pdf_path.exists():
-        print(f"Error: Input file {pdf_path} does not exist", file=sys.stderr)
+    # Process input file
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Error: Input file {input_path} does not exist", file=sys.stderr)
         return 1
-    
-    if not pdf_path.suffix.lower() == '.pdf':
-        print(f"Error: Input file must be a PDF file", file=sys.stderr)
+
+    ext = input_path.suffix.lower()
+    is_pdf = ext == '.pdf'
+    is_image = ext in IMAGE_EXTENSIONS
+    if not is_pdf and not is_image:
+        supported = ', '.join(sorted(IMAGE_EXTENSIONS | {'.pdf'}))
+        print(f"Error: Unsupported file type '{ext}'. Supported: {supported}", file=sys.stderr)
         return 1
-    
+
     # Get API key
     api_key = get_api_key()
     if not api_key:
         print("Error: Mistral API key not found. Set it with MISTRAL_API_KEY environment variable "
               "or use -sk api_key -sv your-api-key to set it in the config file", file=sys.stderr)
         return 1
-    
+
     # Determine output path
-    output_path = None
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = pdf_path.with_suffix('.md')
-    
-    # Process the PDF
-    markdown_content = process_pdf(
-        pdf_path=pdf_path,
-        api_key=api_key,
-        output_json_path=Path(args.output_json) if args.output_json else None
-    )
+        output_path = input_path.with_suffix('.md')
+
+    # Process the file
+    output_json_path = Path(args.output_json) if args.output_json else None
+    if is_pdf:
+        markdown_content = process_pdf(
+            pdf_path=input_path,
+            api_key=api_key,
+            output_json_path=output_json_path,
+        )
+    else:
+        markdown_content = process_image(
+            image_path=input_path,
+            api_key=api_key,
+            output_json_path=output_json_path,
+            max_ratio=args.max_ratio,
+        )
+        # If chunking created a chunks dir, save md there instead
+        chunks_dir = input_path.parent / f"{input_path.stem}_chunks"
+        if chunks_dir.is_dir() and not args.output:
+            output_path = chunks_dir / f"{input_path.stem}.md"
     
     # Write markdown to file
     try:
