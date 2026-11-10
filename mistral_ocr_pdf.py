@@ -230,6 +230,8 @@ def chunk_tall_image(image_path: Path, max_ratio: float = 3.0, search_band_ratio
     Returns a list of paths: the original path if no chunking is needed,
     or paths to the saved chunk files.
     """
+    if max_ratio <= 0:
+        raise ValueError(f"max_ratio must be positive, got {max_ratio}")
     img = Image.open(image_path)
     width, height = img.size
 
@@ -435,6 +437,9 @@ def main():
         else:
             parser.error("input file is required when not setting config values")
     
+    if args.max_ratio <= 0:
+        parser.error("--max-ratio must be positive")
+
     # Process input file
     input_path = Path(args.input)
     if not input_path.exists():
